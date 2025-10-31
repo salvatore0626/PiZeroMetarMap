@@ -1,0 +1,232 @@
+import sys, time, json, socket, urllib.parse, urllib.request
+import datetime as dt
+
+# -----------------------------
+# Hardware (NeoPixel)
+# -----------------------------
+import board
+import neopixel
+
+# ============================================================
+# ============== EDIT THESE FEW SETTINGS ONLY ================
+# ============================================================
+
+# --- LED strip ---
+LED_COUNT     = 20               # <— change to your LED count
+LED_PIN       = board.D18
+LED_ORDER     = neopixel.GRB
+LED_BRIGHT    = 0.5
+
+# --- Flash behavior ---
+BLINK_SPEED_S          = 1.0      # seconds per flash step
+ANIMATION_RUNTIME_S    = 300      # total flashing time; 0 for a single static frame
+HIGH_WIND_THRESHOLD_KT = 25       # flash yellow when sustained OR gust >= this
+ALWAYS_FLASH_FOR_GUSTS = True     # gust >= threshold triggers yellow
+
+# --- What to fetch (state wildcard) ---
+STATE_CODE   = "OR"              # "OR" for Oregon; e.g., "WA" for Washington
+LOOKBACK_HRS = 5                 # hours before now to search
+
+# --- LED -> Airport mapping (one entry per LED, in order) ---
+# Use ICAO strings like "KPDX". Use None for unused LED positions.
+AIRPORTS = [
+    # Example layout — REPLACE with your own order
+    "KPDX", "KHIO", "KTTD", None, "KSLE",
+    "KEUG", "KRBG", "KMFR", "KBDN", "KAST",
+    "KONP", "KOTH", "KLMT", "KCVO", "KMMV",
+    "KUAO", "KSPB", "KHRI", "K4S2", "KDKR",  # replace "KDKR" with a real ICAO or None
+]
+
+AWC_BASE   = "https://aviationweather.gov"
+UA_STRING  = "METARMap/2.0 (+contact@example.com)"  # set your contact if you want
+REQUEST_FMT = "json"  # "json" preferred; XML cache used as fallback
+socket.setdefaulttimeout(10)
+
+# Standard aviation colors (R,G,B) — NeoPixel handles GRB internally.
+COLOR_VFR       = (0, 255, 0)      # Green
+COLOR_MVFR      = (0, 0, 255)      # Blue
+COLOR_IFR       = (255, 0, 0)      # Red
+COLOR_LIFR      = (255, 0, 255)    # Magenta
+COLOR_CLEAR     = (0, 0, 0)        # Off
+COLOR_LIGHTNING = (255, 255, 255)  # White (flash for lightning)
+COLOR_HIGHWIND  = (255, 255, 0)    # Yellow (flash for high winds)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def to_int(v, default=0):
+    try:
+        return int(round(float(str(v).replace('+', '').strip())))
+    except Exception:
+        return default
+
+def to_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def fetch_bytes(url, tries=3, backoff=1.5):
+    last = None
+    for _ in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA_STRING})
+            with urllib.request.urlopen(req) as r:
+                if r.status == 204:  # valid request, no data
+                    return b"[]"
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:  # rate limited
+                time.sleep(backoff); backoff *= 2; last = e; continue
+            last = e; time.sleep(backoff); backoff *= 1.5
+        except Exception as e:
+            last = e; time.sleep(backoff); backoff *= 1.5
+    if last: raise last
+
+def fetch_metar_json_state(state_code, hours, fmt="json"):
+    # Use @STATE (URL-encoded '@' is handled by urlencode)
+    ids_value = "@"+state_code
+    qs = urllib.parse.urlencode({"ids": ids_value, "hours": hours, "format": fmt})
+    url = f"{AWC_BASE}/api/data/metar?{qs}"
+    return fetch_bytes(url)
+
+def parse_json_records(raw):
+    try:
+        j = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return []
+    if isinstance(j, dict) and j.get("type") == "FeatureCollection":
+        return [f.get("properties", {}) for f in j.get("features", [])]
+    if isinstance(j, dict):
+        return j.get("data") or j.get("metar") or []
+    if isinstance(j, list):
+        return j
+    return []
+
+def conditions_from_json(records):
+    """Return dict[ICAO] -> condition dict (latest per station)."""
+    latest = {}
+    for r in records:
+        icao = (r.get("icaoId") or r.get("station") or r.get("station_id") or "").strip().upper()
+        if not icao: 
+            continue
+
+        # Prefer ISO reportTime; else epoch obsTime
+        rt = r.get("reportTime")
+        if rt:
+            try:
+                obs_dt = dt.datetime.fromisoformat(rt.replace("Z","+00:00"))
+            except Exception:
+                obs_dt = dt.datetime.now(dt.timezone.utc)
+        else:
+            try:
+                obs_dt = dt.datetime.fromtimestamp(int(r.get("obsTime", 0)), tz=dt.timezone.utc)
+            except Exception:
+                obs_dt = dt.datetime.now(dt.timezone.utc)
+
+        if icao not in latest or obs_dt > latest[icao]["_dt"]:
+            latest[icao] = {"r": r, "_dt": obs_dt}
+
+    out = {}
+    for icao, bundle in latest.items():
+        r     = bundle["r"]
+        fc    = (r.get("fltCat") or r.get("flight_category") or "").strip().upper()
+        wspd  = to_int(r.get("wspd") or r.get("windSpeedKt"))
+        wgst  = to_int(r.get("wgst") or r.get("windGustKt"))
+        vis   = to_int(r.get("visib") or r.get("visSM"))
+        alt   = to_float(r.get("altim") or r.get("altimHg"))
+        raw   = r.get("rawOb") or r.get("raw_text") or ""
+        wx    = r.get("wxString") or r.get("wx_string") or ""
+
+        # Lightning heuristic (ignore remarks)
+        body = raw.split(" RMK ")[0]
+        lightning = (("LTG" in body) or (" TS" in body)) and (" TSNO" not in raw)
+
+        out[icao] = {
+            "flightCategory": fc,
+            "windSpeed": wspd,
+            "windGustSpeed": wgst,
+            "vis": vis,
+            "altimHg": alt,
+            "obs": wx,
+            "lightning": lightning,
+            "obsTime": bundle["_dt"],
+        }
+    return out
+
+# -----------------------------
+# LED color logic
+# -----------------------------
+def has_high_wind(cond):
+    return (
+        (cond["windSpeed"] >= HIGH_WIND_THRESHOLD_KT) or
+        (ALWAYS_FLASH_FOR_GUSTS and cond["windGustSpeed"] >= HIGH_WIND_THRESHOLD_KT)
+    )
+
+def base_color(fc):
+    if fc == "VFR":  return COLOR_VFR
+    if fc == "MVFR": return COLOR_MVFR
+    if fc == "IFR":  return COLOR_IFR
+    if fc == "LIFR": return COLOR_LIFR
+    return COLOR_CLEAR
+
+def pick_color(cond, phase_on):
+    """phase_on toggles True/False each BLINK step for flashing."""
+    if cond is None:
+        return COLOR_CLEAR
+    # Flash priorities: Lightning (white) > High wind (yellow) > Base category
+    if cond["lightning"] and phase_on:
+        return COLOR_LIGHTNING
+    if has_high_wind(cond) and phase_on:
+        return COLOR_HIGHWIND
+    return base_color(cond["flightCategory"])
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    if len(AIRPORTS) != LED_COUNT:
+        print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. "
+              f"Using the smaller of the two.")
+    usable_leds = min(len(AIRPORTS), LED_COUNT)
+
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — @{STATE_CODE} (JSON only)")
+
+    pixels = neopixel.NeoPixel(
+        LED_PIN, LED_COUNT,
+        brightness=LED_BRIGHT,
+        pixel_order=LED_ORDER,
+        auto_write=False
+    )
+
+    # Fetch everything in the state, then light only the airports we mapped
+    try:
+        raw = fetch_metar_json_state(STATE_CODE, LOOKBACK_HRS, REQUEST_FMT)
+        recs = parse_json_records(raw)
+        conds = conditions_from_json(recs)
+    except Exception as e:
+        print(f"API error: {e}")
+        conds = {}
+
+    total_loops = 1 if ANIMATION_RUNTIME_S <= 0 else max(1, int(round(ANIMATION_RUNTIME_S / BLINK_SPEED_S)))
+    phase_on = True
+    for _ in range(total_loops):
+        for idx in range(usable_leds):
+            icao = AIRPORTS[idx]
+            c = conds.get(icao) if icao else None
+            pixels[idx] = pick_color(c, phase_on)
+        # Clear any remaining LEDs beyond mapping
+        for idx in range(usable_leds, LED_COUNT):
+            pixels[idx] = COLOR_CLEAR
+
+        pixels.show()
+        time.sleep(BLINK_SPEED_S)
+        phase_on = not phase_on
+
+    print("Done.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
