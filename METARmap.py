@@ -19,9 +19,16 @@ LED_BRIGHT    = 0.5
 
 # --- Flash behavior ---
 BLINK_SPEED_S          = 1.0      # seconds per flash step
-ANIMATION_RUNTIME_S    = 300      # total flashing time; 0 for a single static frame
 HIGH_WIND_THRESHOLD_KT = 25       # flash yellow when sustained OR gust >= this
 ALWAYS_FLASH_FOR_GUSTS = True     # gust >= threshold triggers yellow
+
+# --- Duty-cycle controls (per 10-step cycle) ---
+FLASH_CYCLE_STEPS       = 10
+DUTY_LIGHTNING_ON_STEPS = 9       # 90% on for lightning
+DUTY_HIGHWIND_ON_STEPS  = 5       # 50% on for high winds
+
+# --- Data refresh ---
+FETCH_INTERVAL_S = 600           # re-fetch METARs every 10 minutes
 
 # --- What to fetch (state wildcard) ---
 STATE_CODE   = "OR"              # "OR" for Oregon; e.g., "WA" for Washington
@@ -30,16 +37,15 @@ LOOKBACK_HRS = 5                 # hours before now to search
 # --- LED -> Airport mapping (one entry per LED, in order) ---
 # Use ICAO strings like "KPDX". Use None for unused LED positions.
 AIRPORTS = [
-    # Example layout — REPLACE with your own order
-    "KPDX", "KHIO", "KTTD", None, "KSLE",
-    "KEUG", "KRBG", "KMFR", "KBDN", "KAST",
-    "KONP", "KOTH", "KLMT", "KCVO", "KMMV",
-    "KUAO", "KSPB", "KHRI", "K4S2", "KDKR",  # replace "KDKR" with a real ICAO or None
+    "KRBG", "K77S", "KEUG", "KCVO", "KSLE",
+    "KMMV", "KUAO", "KHIO", "KTTD", "KPDX",
+    "KVUO", "KSPB", "KKLS", "K4S2", "KDLS",
+    "KS33", "KS39", "KRDM", "KBDN", "KS21",
 ]
 
 AWC_BASE   = "https://aviationweather.gov"
-UA_STRING  = "METARMap/2.0 (+contact@example.com)"  # set your contact if you want
-REQUEST_FMT = "json"  # "json" preferred; XML cache used as fallback
+UA_STRING  = "METARMap/2.0 (+contact@example.com)"  # set your contact
+REQUEST_FMT = "json"
 socket.setdefaulttimeout(10)
 
 # Standard aviation colors (R,G,B) — NeoPixel handles GRB internally.
@@ -50,6 +56,7 @@ COLOR_LIFR      = (255, 0, 255)    # Magenta
 COLOR_CLEAR     = (0, 0, 0)        # Off
 COLOR_LIGHTNING = (255, 255, 255)  # White (flash for lightning)
 COLOR_HIGHWIND  = (255, 255, 0)    # Yellow (flash for high winds)
+COLOR_NODATA    = (5, 5, 5)
 
 # -----------------------------
 # Helpers
@@ -84,7 +91,6 @@ def fetch_bytes(url, tries=3, backoff=1.5):
     if last: raise last
 
 def fetch_metar_json_state(state_code, hours, fmt="json"):
-    # Use @STATE (URL-encoded '@' is handled by urlencode)
     ids_value = "@"+state_code
     qs = urllib.parse.urlencode({"ids": ids_value, "hours": hours, "format": fmt})
     url = f"{AWC_BASE}/api/data/metar?{qs}"
@@ -108,7 +114,7 @@ def conditions_from_json(records):
     latest = {}
     for r in records:
         icao = (r.get("icaoId") or r.get("station") or r.get("station_id") or "").strip().upper()
-        if not icao: 
+        if not icao:
             continue
 
         # Prefer ISO reportTime; else epoch obsTime
@@ -170,27 +176,25 @@ def base_color(fc):
     if fc == "LIFR": return COLOR_LIFR
     return COLOR_CLEAR
 
-def pick_color(cond, phase_on):
-    """phase_on toggles True/False each BLINK step for flashing."""
+def pick_color(cond, lightning_on, highwind_on):
     if cond is None:
-        return COLOR_CLEAR
-    # Flash priorities: Lightning (white) > High wind (yellow) > Base category
-    if cond["lightning"] and phase_on:
+        return COLOR_NODATA
+    # Priority: Lightning > High wind > Base category
+    if cond["lightning"] and lightning_on:
         return COLOR_LIGHTNING
-    if has_high_wind(cond) and phase_on:
+    if has_high_wind(cond) and highwind_on:
         return COLOR_HIGHWIND
     return base_color(cond["flightCategory"])
 
 # -----------------------------
-# Main
+# Main (continuous)
 # -----------------------------
 def main():
     if len(AIRPORTS) != LED_COUNT:
-        print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. "
-              f"Using the smaller of the two.")
+        print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. Using the smaller of the two.")
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — @{STATE_CODE} (JSON only)")
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — @{STATE_CODE}")
 
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT,
@@ -199,31 +203,38 @@ def main():
         auto_write=False
     )
 
-    # Fetch everything in the state, then light only the airports we mapped
-    try:
-        raw = fetch_metar_json_state(STATE_CODE, LOOKBACK_HRS, REQUEST_FMT)
-        recs = parse_json_records(raw)
-        conds = conditions_from_json(recs)
-    except Exception as e:
-        print(f"API error: {e}")
-        conds = {}
+    conds = {}
+    last_fetch = 0.0
+    step = 0
 
-    total_loops = 1 if ANIMATION_RUNTIME_S <= 0 else max(1, int(round(ANIMATION_RUNTIME_S / BLINK_SPEED_S)))
-    phase_on = True
-    for _ in range(total_loops):
+    while True:
+        now = time.time()
+        if (now - last_fetch >= FETCH_INTERVAL_S) or not conds:
+            try:
+                raw = fetch_metar_json_state(STATE_CODE, LOOKBACK_HRS, REQUEST_FMT)
+                recs = parse_json_records(raw)
+                conds = conditions_from_json(recs)
+                print(f"[{dt.datetime.now():%H:%M}] Updated METARs ({len(conds)} stations)")
+            except Exception as e:
+                print(f"[{dt.datetime.now():%H:%M}] API error: {e}")
+                conds = {}  # keep LEDs off until next retry
+            last_fetch = now
+
+        lightning_on = (step % FLASH_CYCLE_STEPS) < DUTY_LIGHTNING_ON_STEPS
+        highwind_on  = (step % FLASH_CYCLE_STEPS) < DUTY_HIGHWIND_ON_STEPS
+
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
             c = conds.get(icao) if icao else None
-            pixels[idx] = pick_color(c, phase_on)
+            pixels[idx] = pick_color(c, lightning_on, highwind_on)
+
         # Clear any remaining LEDs beyond mapping
         for idx in range(usable_leds, LED_COUNT):
             pixels[idx] = COLOR_CLEAR
 
         pixels.show()
         time.sleep(BLINK_SPEED_S)
-        phase_on = not phase_on
-
-    print("Done.")
+        step += 1
 
 if __name__ == "__main__":
     try:
