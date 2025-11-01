@@ -19,7 +19,7 @@ LED_BRIGHT    = 0.5
 
 # --- Flash behavior ---
 BLINK_SPEED_S          = 1.0      # seconds per flash step
-HIGH_WIND_THRESHOLD_KT = 25       # flash yellow when sustained OR gust >= this
+HIGH_WIND_THRESHOLD_KT = 20       # flash yellow when sustained OR gust >= this
 ALWAYS_FLASH_FOR_GUSTS = True     # gust >= threshold triggers yellow
 
 # --- Duty-cycle controls (per 10-step cycle) ---
@@ -31,7 +31,6 @@ DUTY_HIGHWIND_ON_STEPS  = 5       # 50% on for high winds
 FETCH_INTERVAL_S = 600           # re-fetch METARs every 10 minutes
 
 # --- What to fetch (state wildcard) ---
-STATE_CODE   = "OR"              # "OR" for Oregon; e.g., "WA" for Washington
 LOOKBACK_HRS = 5                 # hours before now to search
 
 # --- LED -> Airport mapping (one entry per LED, in order) ---
@@ -42,6 +41,8 @@ AIRPORTS = [
     "KVUO", "KSPB", "KKLS", "K4S2", "KDLS",
     "KS33", "KS39", "KRDM", "KBDN", "KS21",
 ]
+
+STATION_IDS = [a.strip().upper() for a in AIRPORTS if a]
 
 AWC_BASE   = "https://aviationweather.gov"
 UA_STRING  = "METARMap/2.0 (+contact@example.com)"  # set your contact
@@ -94,11 +95,24 @@ def fetch_bytes(url, tries=3, backoff=1.5):
             last = e; time.sleep(backoff); backoff *= 1.5
     if last: raise last
 
-def fetch_metar_json_state(state_code, hours, fmt="json"):
-    ids_value = "@"+state_code
-    qs = urllib.parse.urlencode({"ids": ids_value, "hours": hours, "format": fmt})
-    url = f"{AWC_BASE}/api/data/metar?{qs}"
-    return fetch_bytes(url)
+def fetch_metar_json_ids(stations, hours, fmt="json", chunk_size=150):
+    ids = sorted({s.strip().upper() for s in stations if s and str(s).strip()})
+    all_records = []
+
+    for i in range(0, len(ids), chunk_size):
+        subset = ids[i:i+chunk_size]
+        qs = urllib.parse.urlencode({
+            "ids": ",".join(subset),
+            "hours": hours,
+            "format": fmt
+        })
+        url = f"{AWC_BASE}/api/data/metar?{qs}"
+        raw = fetch_bytes(url)
+        all_records.extend(parse_json_records(raw))
+
+    # Re-encode to JSON bytes so the rest of your pipeline can stay the same if needed
+    return all_records
+
 
 def parse_json_records(raw):
     try:
@@ -142,14 +156,21 @@ def conditions_from_json(records):
         r     = bundle["r"]
         fc    = (r.get("fltCat") or r.get("flight_category") or "").strip().upper()
         wspd  = to_int(r.get("wspd") or r.get("windSpeedKt"))
-        wgst  = to_int(r.get("wgst") or r.get("windGustKt"))
+        wgst = to_int(
+            r.get("wgst") or
+            r.get("gust") or
+            r.get("gustKt") or
+            r.get("windGustKt") or
+            r.get("wind_gust_kt") or
+            r.get("gust_kts")
+        )
         vis   = to_int(r.get("visib") or r.get("visSM"))
         alt   = to_float(r.get("altim") or r.get("altimHg"))
         raw   = r.get("rawOb") or r.get("raw_text") or ""
         wx    = r.get("wxString") or r.get("wx_string") or ""
 
         # Lightning heuristic (ignore remarks)
-        body = raw.split(" RMK ")[0]
+        body = raw.split(" RMK", 1)[0]
         lightning = (("LTG" in body) or (" TS" in body)) and (" TSNO" not in raw)
 
         out[icao] = {
@@ -199,7 +220,7 @@ def main():
         print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. Using the smaller of the two.")
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — @{STATE_CODE}")
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — {len(STATION_IDS)} stations")
 
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT,
@@ -220,8 +241,7 @@ def main():
         # Fetch/update block
         if (now - last_fetch >= FETCH_INTERVAL_S) or not conds:
             try:
-                raw = fetch_metar_json_state(STATE_CODE, LOOKBACK_HRS, REQUEST_FMT)
-                recs = parse_json_records(raw)
+                recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HRS, REQUEST_FMT)
                 conds = conditions_from_json(recs)
 
                 # Optional: clear terminal for a clean dashboard
