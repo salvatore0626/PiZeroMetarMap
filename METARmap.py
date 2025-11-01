@@ -1,4 +1,4 @@
-import sys, time, json, socket, urllib.parse, urllib.request
+import sys, time, json, socket, urllib.parse, urllib.request, os
 import datetime as dt
 
 # -----------------------------
@@ -72,6 +72,10 @@ def to_float(v, default=0.0):
         return float(v)
     except Exception:
         return default
+    
+def clear_terminal():
+    # Works on macOS, Linux, and Windows
+    os.system("cls" if os.name == "nt" else "clear")
 
 def fetch_bytes(url, tries=3, backoff=1.5):
     last = None
@@ -190,6 +194,7 @@ def pick_color(cond, lightning_on, highwind_on):
 # Main (continuous)
 # -----------------------------
 def main():
+    # Sanity + setup
     if len(AIRPORTS) != LED_COUNT:
         print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. Using the smaller of the two.")
     usable_leds = min(len(AIRPORTS), LED_COUNT)
@@ -203,26 +208,52 @@ def main():
         auto_write=False
     )
 
+    # State for updates/animation
     conds = {}
     last_fetch = 0.0
     step = 0
 
+    # Continuous loop
     while True:
         now = time.time()
+
+        # Fetch/update block
         if (now - last_fetch >= FETCH_INTERVAL_S) or not conds:
             try:
                 raw = fetch_metar_json_state(STATE_CODE, LOOKBACK_HRS, REQUEST_FMT)
                 recs = parse_json_records(raw)
                 conds = conditions_from_json(recs)
+
+                # Optional: clear terminal for a clean dashboard
+                clear_terminal()
+
                 print(f"[{dt.datetime.now():%H:%M}] Updated METARs ({len(conds)} stations)")
+
+                # Log which mapped stations have no data
+                missing = [a for a in AIRPORTS if a and a not in conds]
+                if missing:
+                    print("No recent METAR for:", ", ".join(missing))
+
+                # Log high winds & lightning stations
+                high_wind = [a for a, c in conds.items() if has_high_wind(c)]
+                lightning = [a for a, c in conds.items() if c.get("lightning")]
+
+                if high_wind:
+                    print("High winds at:", ", ".join(high_wind))
+                if lightning:
+                    print("Lightning reported at:", ", ".join(lightning))
+
             except Exception as e:
                 print(f"[{dt.datetime.now():%H:%M}] API error: {e}")
-                conds = {}  # keep LEDs off until next retry
+                conds = {}  # keep LEDs in no-data state until next retry
+
             last_fetch = now
 
+        # Duty-cycle animation (90/10 lightning, 50/50 high wind)
         lightning_on = (step % FLASH_CYCLE_STEPS) < DUTY_LIGHTNING_ON_STEPS
         highwind_on  = (step % FLASH_CYCLE_STEPS) < DUTY_HIGHWIND_ON_STEPS
 
+        # Render one frame
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
             c = conds.get(icao) if icao else None
