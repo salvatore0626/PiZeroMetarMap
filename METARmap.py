@@ -15,17 +15,17 @@ import neopixel
 LED_COUNT     = 20               # <— change to your LED count
 LED_PIN       = board.D18
 LED_ORDER     = neopixel.GRB
-LED_BRIGHT    = 0.5
+LED_BRIGHT    = 0.6
 
 # --- Flash behavior ---
-BLINK_SPEED_S          = 1.0      # seconds per flash step
+BLINK_SPEED_S          = 0.1      # seconds per flash step
 HIGH_WIND_THRESHOLD_KT = 20       # flash yellow when sustained OR gust >= this
 ALWAYS_FLASH_FOR_GUSTS = True     # gust >= threshold triggers yellow
 
 # --- Duty-cycle controls (per 10-step cycle) ---
 FLASH_CYCLE_STEPS       = 10
-DUTY_LIGHTNING_ON_STEPS = 9       # 90% on for lightning
-DUTY_HIGHWIND_ON_STEPS  = 5       # 50% on for high winds
+DUTY_LIGHTNING_ON_STEPS = 2 
+DUTY_HIGHWIND_ON_STEPS  = 5
 
 # --- Data refresh ---
 FETCH_INTERVAL_S = 600           # re-fetch METARs every 10 minutes
