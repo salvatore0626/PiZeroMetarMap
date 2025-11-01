@@ -113,7 +113,6 @@ def fetch_metar_json_ids(stations, hours, fmt="json", chunk_size=150):
     # Re-encode to JSON bytes so the rest of your pipeline can stay the same if needed
     return all_records
 
-
 def parse_json_records(raw):
     try:
         j = json.loads(raw.decode("utf-8"))
@@ -270,8 +269,22 @@ def main():
             last_fetch = now
 
         # Duty-cycle animation (90/10 lightning, 50/50 high wind)
-        lightning_on = (step % FLASH_CYCLE_STEPS) < DUTY_LIGHTNING_ON_STEPS
-        highwind_on  = (step % FLASH_CYCLE_STEPS) < DUTY_HIGHWIND_ON_STEPS
+        LIGHTNING_FREQ_HZ = 2.0   # 2 Hz = period 0.5 s
+        HIGHWIND_FREQ_HZ  = 5.0   # 5 Hz = period 0.2 s
+        LIGHTNING_DUTY    = 0.5   # 50% on
+        HIGHWIND_DUTY     = 0.5   # 50% on
+
+        t = time.monotonic()
+
+        def is_on(freq_hz, duty, t_now):
+            if freq_hz <= 0: 
+                return False
+            period = 1.0 / freq_hz
+            phase  = (t_now % period) / period  # 0..1
+            return phase < duty
+
+        lightning_on = is_on(LIGHTNING_FREQ_HZ, LIGHTNING_DUTY, t)
+        highwind_on  = is_on(HIGHWIND_FREQ_HZ,  HIGHWIND_DUTY,  t)
 
         # Render one frame
         for idx in range(usable_leds):
