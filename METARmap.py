@@ -1,5 +1,12 @@
-import sys, time, json, socket, urllib.parse, urllib.request, os
+import sys, time, json, socket, urllib.parse, urllib.request, os, select
 import datetime as dt
+
+# Raw terminal for non-blocking single-key reads
+try:
+    import termios, tty
+    _HAS_TTY = True
+except Exception:
+    _HAS_TTY = False
 
 # -----------------------------
 # Hardware (NeoPixel)
@@ -17,10 +24,13 @@ LED_PIN     = board.D18
 LED_ORDER   = neopixel.GRB
 LED_BRIGHT  = 0.6
 
-# Animation / Flashing
-UPDATE_HZ            = 10.0      # LED update rate (e.g., 10 Hz)
-LIGHTNING_INTENSITY  = 0.5       # 0.0=never flash, 1.0=solid white, 0.5=half-time white
-HIGHWIND_INTENSITY   = 0.5       # 0.0=never flash, 1.0=solid yellow, 0.5=half-time yellow
+# Animation / Flashing (intensity = fraction of each second 'on')
+UPDATE_HZ            = 10.0      # LED update rate
+LIGHTNING_INTENSITY  = 0.5       # 0.0=never flash, 1.0=solid white
+HIGHWIND_INTENSITY   = 0.5       # 0.0=never flash, 1.0=solid yellow
+
+# Live-only behavior (when True, stations with no recent METAR go to no-data immediately)
+LIVE_ONLY            = False     # toggled at runtime with key 'A' / 'a'
 
 # Wind logic
 HIGH_WIND_THRESHOLD_KT = 20      # sustained >= threshold OR (gust >= threshold if enabled)
@@ -224,14 +234,44 @@ def flashing_state(intensity: float, t_now: float, phase_offset: float) -> bool:
     return phase < intensity
 
 # -----------------------------
+# Non-blocking single-key input
+# -----------------------------
+class KeyReader:
+    def __enter__(self):
+        self.enabled = _HAS_TTY and sys.stdin.isatty()
+        if not self.enabled:
+            return self
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        if getattr(self, "enabled", False):
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def read_key(self):
+        """Return a single char if available, else None."""
+        if not getattr(self, "enabled", False):
+            return None
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            ch = sys.stdin.read(1)
+            return ch
+        return None
+
+# -----------------------------
 # Main (continuous)
 # -----------------------------
 def main():
+    global LIGHTNING_INTENSITY, HIGHWIND_INTENSITY, LIVE_ONLY
+
     if len(AIRPORTS) != LED_COUNT:
         print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. Using the smaller of the two.")
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
     print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — {len(STATION_IDS)} stations")
+    print("Hotkeys: '1' → intensities=1.0  |  '0' → 0.0  |  '5' → 0.5  |  'A' → toggle LIVE_ONLY")
 
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT,
@@ -243,56 +283,81 @@ def main():
     conds = {}
     last_fetch = 0.0
 
-    while True:
-        now = time.time()
+    with KeyReader() as keys:
+        while True:
+            now = time.time()
 
-        # Fetch/update block
-        if (now - last_fetch >= FETCH_EVERY_S) or not conds:
+            # Fetch/update block
+            if (now - last_fetch >= FETCH_EVERY_S) or not conds:
+                try:
+                    recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
+                    conds = conditions_from_json(recs)
+
+                    clear_terminal()
+                    print(f"[{dt.datetime.now():%H:%M}] Updated METARs ({len(conds)} stations)")
+
+                    # Missing data report
+                    missing = [a for a in AIRPORTS if a and a not in conds]
+                    if missing:
+                        print("No recent METAR for:", ", ".join(missing))
+                        if LIVE_ONLY:
+                            # Clear stale data immediately in live-only mode
+                            for a in missing:
+                                conds.pop(a, None)
+
+                    # High winds & lightning report
+                    hw = [a for a, c in conds.items() if has_high_wind(c)]
+                    lt = [a for a, c in conds.items() if c.get("lightning")]
+                    if hw: print("High winds at:", ", ".join(hw))
+                    if lt: print("Lightning reported at:", ", ".join(lt))
+
+                except Exception as e:
+                    print(f"[{dt.datetime.now():%H:%M}] API error: {e}")
+                    # Keep last known display; don't nuke conds here.
+                finally:
+                    last_fetch = now
+
+            # Handle hotkeys (non-blocking)
+            ch = keys.read_key()
+            if ch:
+                if ch == '1':
+                    LIGHTNING_INTENSITY = 1.0
+                    HIGHWIND_INTENSITY  = 1.0
+                    print("[keys] Intensities set to 1.0 (solid)")
+                elif ch == '0':
+                    LIGHTNING_INTENSITY = 0.0
+                    HIGHWIND_INTENSITY  = 0.0
+                    print("[keys] Intensities set to 0.0 (off)")
+                elif ch == '5':
+                    LIGHTNING_INTENSITY = 0.5
+                    HIGHWIND_INTENSITY  = 0.5
+                    print("[keys] Intensities set to 0.5 (half-time)")
+                elif ch in ('a', 'A'):
+                    LIVE_ONLY = not LIVE_ONLY
+                    print(f"[keys] LIVE_ONLY is now {LIVE_ONLY}")
+
+            # Intensity-based flashing (per-station de-synced)
+            t = time.monotonic() % 1.0  # 1-second cycle for intensity mapping
+
+            # Render one frame
+            for idx in range(usable_leds):
+                icao = AIRPORTS[idx]
+                c = conds.get(icao) if icao else None
+                phase = station_phase_offset(icao)  # set to 0.0 for perfect sync
+                lightning_on = flashing_state(LIGHTNING_INTENSITY, t, phase)
+                highwind_on  = flashing_state(HIGHWIND_INTENSITY,  t, phase)
+                pixels[idx] = pick_color(c, lightning_on, highwind_on)
+
+            # Clear any remaining LEDs beyond mapping
+            for idx in range(usable_leds, LED_COUNT):
+                pixels[idx] = COLOR_CLEAR
+
             try:
-                recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
-                conds = conditions_from_json(recs)
-
-                clear_terminal()
-                print(f"[{dt.datetime.now():%H:%M}] Updated METARs ({len(conds)} stations)")
-
-                # Missing data report
-                missing = [a for a in AIRPORTS if a and a not in conds]
-                if missing:
-                    print("No recent METAR for:", ", ".join(missing))
-                    # Optional: uncomment to turn missing LEDs to COLOR_NODATA immediately:
-                    # for a in missing:
-                    #     conds.pop(a, None)
-
-                # High winds & lightning report
-                hw = [a for a, c in conds.items() if has_high_wind(c)]
-                lt = [a for a, c in conds.items() if c.get("lightning")]
-                if hw: print("High winds at:", ", ".join(hw))
-                if lt: print("Lightning reported at:", ", ".join(lt))
-
+                pixels.show()
             except Exception as e:
-                print(f"[{dt.datetime.now():%H:%M}] API error: {e}")
-                conds = {}  # LEDs show no-data until next retry
+                print("LED driver error:", e)
 
-            last_fetch = now
-
-        # Intensity-based flashing (per-station de-synced)
-        t = time.monotonic() % 1.0  # 1-second cycle for intensity mapping
-
-        # Render one frame
-        for idx in range(usable_leds):
-            icao = AIRPORTS[idx]
-            c = conds.get(icao) if icao else None
-            phase = station_phase_offset(icao)  # de-sync this LED's flash (set to zero for perfect sync)
-            lightning_on = flashing_state(LIGHTNING_INTENSITY, t, phase)
-            highwind_on  = flashing_state(HIGHWIND_INTENSITY,  t, phase)
-            pixels[idx] = pick_color(c, lightning_on, highwind_on)
-
-        # Clear any remaining LEDs beyond mapping
-        for idx in range(usable_leds, LED_COUNT):
-            pixels[idx] = COLOR_CLEAR
-
-        pixels.show()
-        time.sleep(SLEEP_S)
+            time.sleep(SLEEP_S)
 
 if __name__ == "__main__":
     try:
