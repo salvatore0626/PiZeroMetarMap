@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys, time, json, socket, urllib.parse, urllib.request, os, threading
 import datetime as dt
 import board
@@ -7,34 +8,32 @@ import neopixel
 # =============== SETTINGS — EDIT THESE ONLY =================
 # ============================================================
 
-# LED strip
-LED_COUNT   = 20
-LED_PIN     = board.D18              # uses PWM; see note below about audio
-LED_ORDER   = neopixel.GRB
-LED_BRIGHT  = 0.6
+# LED hardware
+LED_COUNT      = 20
+LED_PIN        = board.D18           # same as old script (GPIO18 / PWM)
+LED_ORDER      = neopixel.GRB
+LED_BRIGHTNESS = 0.6
 
-# Animation / Flashing (intensity = fraction of each second 'on')
-UPDATE_HZ            = 10.0          # render rate
-LIGHTNING_INTENSITY  = 0.5           # 0=never flash, 1=solid white
-HIGHWIND_INTENSITY   = 0.5           # 0=never flash, 1=solid yellow
+# --- Animation style (match metar.py behavior) ---
+ACTIVATE_WIND_ANIMATION      = True   # True = animate winds; False = static
+ACTIVATE_LIGHTNING_ANIMATION = True   # True = animate lightning; False = static
+FADE_INSTEAD_OF_BLINK        = True   # True = fade/blend; False = on/off blink
+BLINK_SPEED_S                = 1.0    # seconds between animation toggles (≈1 Hz)
 
-# Optional heartbeat LED for diagnostics (blinks at 1 Hz regardless of weather)
-# Set to an LED index (0..LED_COUNT-1) to enable, or None to disable.
-HEARTBEAT_LED        = None          # e.g., set to LED_COUNT-1 to test
-
-# Wind logic
-HIGH_WIND_THRESHOLD_KT = 20
-FLASH_ON_GUSTS         = True
+# Wind thresholds (similar semantics to your metar.py)
+WIND_ANIM_THRESHOLD_KT       = 25     # >= this → animate (blink/fade) for wind
+ALWAYS_ANIMATE_FOR_GUSTS     = False  # if True, any gust animates regardless of speed
+VERY_HIGH_WIND_YELLOW_KT     = 35     # >= this → solid yellow (set -1 to disable)
 
 # Data fetch
-FETCH_EVERY_S   = 600                # normal fetch interval (10 minutes)
-ERROR_RETRY_S   = 60                 # after an error, try again in ~60s
+FETCH_EVERY_S   = 600                # normal interval (10 min)
+ERROR_RETRY_S   = 60                 # retry sooner after an error
 LOOKBACK_HOURS  = 5
 API_BASE        = "https://aviationweather.gov"
 USER_AGENT      = "METARMap/2.0 (+contact@example.com)"
 NETWORK_TIMEOUT_S = 10
 
-# Mapping (one per LED; use None for unused positions)
+# LED -> Airport mapping
 AIRPORTS = [
     "KRBG", "K77S", "KEUG", "KCVO", "KSLE",
     "KMMV", "KUAO", "KHIO", "KTTD", "KPDX",
@@ -58,8 +57,8 @@ COLOR_NODATA    = (5, 5, 5)
 
 socket.setdefaulttimeout(NETWORK_TIMEOUT_S)
 STATION_IDS = [a.strip().upper() for a in AIRPORTS if a]
-SLEEP_S = 1.0 / UPDATE_HZ
 
+# -------- Utilities --------
 def to_int(v, default=0):
     try:
         return int(round(float(str(v).replace('+', '').strip())))
@@ -75,6 +74,12 @@ def to_float(v, default=0.0):
 def clear_terminal():
     os.system("cls" if os.name == "nt" else "clear")
 
+def blend(c1, c2, alpha):
+    """Linear blend between two RGB tuples. alpha in [0..1]."""
+    a = max(0.0, min(1.0, float(alpha)))
+    return (int(c1[0]*(1-a)+c2[0]*a), int(c1[1]*(1-a)+c2[1]*a), int(c1[2]*(1-a)+c2[2]*a))
+
+# -------- Fetch / parse METAR (JSON endpoint) --------
 def fetch_bytes(url, tries=3, backoff=1.5):
     last = None
     for _ in range(tries):
@@ -117,11 +122,15 @@ def parse_json_records(raw):
     return []
 
 def conditions_from_json(records):
+    """
+    Return dict[ICAO] -> condition dict (latest per station).
+    Keys used: flightCategory, windSpeed, windGustSpeed, lightning, obsTime
+    """
     latest = {}
     for r in records:
         icao = (r.get("icaoId") or r.get("station") or r.get("station_id") or "").strip().upper()
-        if not icao:
-            continue
+        if not icao: continue
+
         rt = r.get("reportTime")
         if rt:
             try:
@@ -133,45 +142,33 @@ def conditions_from_json(records):
                 obs_dt = dt.datetime.fromtimestamp(int(r.get("obsTime", 0)), tz=dt.timezone.utc)
             except Exception:
                 obs_dt = dt.datetime.now(dt.timezone.utc)
+
         if icao not in latest or obs_dt > latest[icao]["_dt"]:
             latest[icao] = {"r": r, "_dt": obs_dt}
 
     out = {}
     for icao, bundle in latest.items():
-        r = bundle["r"]
-        fc = (r.get("fltCat") or r.get("flight_category") or "").strip().upper()
-        wspd = to_int(r.get("wspd") or r.get("windSpeedKt"))
-        wgst = to_int(
+        r     = bundle["r"]
+        fc    = (r.get("fltCat") or r.get("flight_category") or "").strip().upper()
+        wspd  = to_int(r.get("wspd") or r.get("windSpeedKt"))
+        wgst  = to_int(
             r.get("wgst") or r.get("gust") or r.get("gustKt") or
             r.get("windGustKt") or r.get("wind_gust_kt") or r.get("gust_kts")
         )
-        vis = to_int(r.get("visib") or r.get("visSM"))
-        alt = to_float(r.get("altim") or r.get("altimHg"))
-        raw = r.get("rawOb") or r.get("raw_text") or ""
-        wx  = r.get("wxString") or r.get("wx_string") or ""
-
-        # Lightning heuristic (ignore remarks)
-        body = raw.split(" RMK", 1)[0]
+        raw   = r.get("rawOb") or r.get("raw_text") or ""
+        body  = raw.split(" RMK", 1)[0]
         lightning = (("LTG" in body) or (" TS" in body)) and (" TSNO" not in raw)
 
         out[icao] = {
             "flightCategory": fc,
             "windSpeed": wspd,
             "windGustSpeed": wgst,
-            "vis": vis,
-            "altimHg": alt,
-            "obs": wx,
             "lightning": lightning,
             "obsTime": bundle["_dt"],
         }
     return out
 
-def has_high_wind(cond):
-    return (
-        (cond["windSpeed"] >= HIGH_WIND_THRESHOLD_KT) or
-        (FLASH_ON_GUSTS and cond["windGustSpeed"] >= HIGH_WIND_THRESHOLD_KT)
-    )
-
+# -------- Color logic like metar.py --------
 def base_color(fc):
     if fc == "VFR":  return COLOR_VFR
     if fc == "MVFR": return COLOR_MVFR
@@ -179,35 +176,47 @@ def base_color(fc):
     if fc == "LIFR": return COLOR_LIFR
     return COLOR_CLEAR
 
-def pick_color(cond, lightning_on, highwind_on):
+def is_very_high_wind(cond):
+    if VERY_HIGH_WIND_YELLOW_KT < 0:
+        return False
+    return max(cond.get("windSpeed", 0), cond.get("windGustSpeed", 0)) >= VERY_HIGH_WIND_YELLOW_KT
+
+def wind_should_animate(cond):
+    if not ACTIVATE_WIND_ANIMATION:
+        return False
+    if ALWAYS_ANIMATE_FOR_GUSTS and cond.get("windGustSpeed", 0) > 0:
+        return True
+    return max(cond.get("windSpeed", 0), cond.get("windGustSpeed", 0)) >= WIND_ANIM_THRESHOLD_KT
+
+def pick_color_for_station(cond, blink_on):
+    """metar.py priority: Lightning flash > High-wind yellow (optional solid) > Base category."""
     if cond is None:
         return COLOR_NODATA
-    if cond.get("lightning") and lightning_on:
-        return COLOR_LIGHTNING
-    if has_high_wind(cond) and highwind_on:
+
+    base = base_color(cond.get("flightCategory", ""))
+
+    # Lightning animation
+    if ACTIVATE_LIGHTNING_ANIMATION and cond.get("lightning", False):
+        if FADE_INSTEAD_OF_BLINK:
+            return blend(base, COLOR_LIGHTNING, 1.0 if blink_on else 0.0)
+        else:
+            return COLOR_LIGHTNING if blink_on else base
+
+    # Very high wind → solid yellow (overrides animation)
+    if is_very_high_wind(cond):
         return COLOR_HIGHWIND
-    return base_color(cond.get("flightCategory", ""))
 
-def station_phase_offset(icao: str) -> float:
-    if not icao:
-        return 0.0
-    return (sum(ord(c) for c in icao) & 255) / 256.0
+    # Normal wind animation (blink/fade to yellow)
+    if wind_should_animate(cond):
+        if FADE_INSTEAD_OF_BLINK:
+            return blend(base, COLOR_HIGHWIND, 1.0 if blink_on else 0.0)
+        else:
+            return COLOR_HIGHWIND if blink_on else base
 
-def flashing_state(intensity: float, t_now: float, phase_offset: float) -> bool:
-    """
-    Returns True/False depending on intensity 0–1.
-    intensity is the fraction of each 1s cycle that's 'on'.
-    """
-    if intensity <= 0.0:
-        return False
-    if intensity >= 1.0:
-        return True
-    phase = (t_now + phase_offset) % 1.0
-    return phase < intensity
+    # Otherwise, static base color
+    return base
 
-# -----------------------------
-# Background fetcher (non-blocking)
-# -----------------------------
+# -------- Background fetcher (non-blocking, keeps old data on error) --------
 _conds = {}
 _conds_lock = threading.Lock()
 _last_fetch = 0.0
@@ -221,21 +230,15 @@ def _do_fetch():
 
         clear_terminal()
         print(f"[{dt.datetime.now():%H:%M}] Updated METARs ({len(new_conds)} stations)")
-
         missing = [a for a in AIRPORTS if a and a not in new_conds]
         if missing:
             print("No recent METAR for:", ", ".join(missing))
 
-        hw = [a for a, c in new_conds.items() if has_high_wind(c)]
-        lt = [a for a, c in new_conds.items() if c.get("lightning")]
-        if hw: print("High winds at:", ", ".join(hw))
-        if lt: print("Lightning reported at:", ", ".join(lt))
-
         with _conds_lock:
-            _conds = new_conds  # ✅ swap in fresh data
+            _conds = new_conds        # ✅ swap in fresh data
         _last_fetch = time.time()
     except Exception as e:
-        # ❌ keep previous data; just report and adjust retry timing
+        # ❌ keep old _conds; schedule earlier retry
         print(f"[{dt.datetime.now():%H:%M}] API error (keeping previous data): {e}")
         _last_fetch = time.time() - (FETCH_EVERY_S - ERROR_RETRY_S)
     finally:
@@ -250,73 +253,60 @@ def trigger_fetch_if_needed(now: float):
         _fetching = True
         threading.Thread(target=_do_fetch, daemon=True).start()
 
-# -----------------------------
-# Main Loop
-# -----------------------------
+# ============================================================
+# Main (metar.py-style animation cadence)
+# ============================================================
 def main():
     if len(AIRPORTS) != LED_COUNT:
         print(f"NOTE: AIRPORTS has {len(AIRPORTS)} entries but LED_COUNT={LED_COUNT}. Using smaller of the two.")
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
     print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Starting METAR Map — {len(STATION_IDS)} stations")
-    print("Note: If LEDs freeze, ensure onboard audio is disabled (add 'dtparam=audio=off' in /boot/config.txt and reboot).")
+    print("Hint: if LEDs freeze on GPIO18, disable HDMI audio or use SPI driver.")
 
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT,
-        brightness=LED_BRIGHT,
+        brightness=LED_BRIGHTNESS,
         pixel_order=LED_ORDER,
         auto_write=False
     )
 
-    # Watchdog to detect render stalls
-    FRAME_BUDGET = (1.0 / UPDATE_HZ) * 4
-    last_tick = time.monotonic()
+    # metar.py-style toggling: simple 1 Hz blink/fade gate
+    blink_on = False
+    last_toggle = time.monotonic()
 
     while True:
         now = time.time()
-
-        # Non-blocking fetch trigger
         trigger_fetch_if_needed(now)
 
-        # Snapshot the latest conditions for this frame
+        # Toggle blink/fade at BLINK_SPEED_S (≈1 Hz)
+        tnow = time.monotonic()
+        if (tnow - last_toggle) >= BLINK_SPEED_S:
+            blink_on = not blink_on
+            last_toggle = tnow
+
+        # Snapshot conditions
         with _conds_lock:
             conds = _conds.copy()
 
-        # Time base for flashing
-        t_phase = time.monotonic() % 1.0
-
-        # Render one frame
+        # Render one frame (no per-station phase math; match metar.py feel)
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
             c = conds.get(icao) if icao else None
-            phase = station_phase_offset(icao)
-            lightning_on = flashing_state(LIGHTNING_INTENSITY, t_phase, phase)
-            highwind_on  = flashing_state(HIGHWIND_INTENSITY,  t_phase, phase)
-            pixels[idx] = pick_color(c, lightning_on, highwind_on)
+            pixels[idx] = pick_color_for_station(c, blink_on)
 
-        # Optional heartbeat LED (diagnostic only)
-        if HEARTBEAT_LED is not None and 0 <= HEARTBEAT_LED < LED_COUNT:
-            beat = (time.monotonic() % 1.0) < 0.5   # 1 Hz blink, 50% duty
-            pixels[HEARTBEAT_LED] = (20, 20, 20) if beat else (0, 0, 0)
-
-        # Clear any remaining LEDs beyond mapping
+        # Any extra LEDs beyond mapping → off
         for idx in range(usable_leds, LED_COUNT):
-            if idx != HEARTBEAT_LED:
-                pixels[idx] = COLOR_CLEAR
+            pixels[idx] = COLOR_CLEAR
 
         try:
             pixels.show()
         except Exception as e:
             print("LED driver error:", e)
 
-        # Render stall watchdog
-        now_tick = time.monotonic()
-        dtick = now_tick - last_tick
-        if dtick > FRAME_BUDGET:
-            print(f"[dbg] render stall: {dtick:.3f}s")
-        last_tick = now_tick
-
-        time.sleep(SLEEP_S)
+        # Sleep a modest amount; metar.py used ~1 Hz cadence.
+        # We’ll do ~10 fps so fades look smooth when FADE_INSTEAD_OF_BLINK=True.
+        time.sleep(0.1 if FADE_INSTEAD_OF_BLINK else 0.05)
 
 if __name__ == "__main__":
     try:
