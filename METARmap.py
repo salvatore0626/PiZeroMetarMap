@@ -18,7 +18,6 @@ ACTIVATE_WIND_ANIMATION      = True
 ACTIVATE_LIGHTNING_ANIMATION = True
 FADE_INSTEAD_OF_BLINK        = True     # wind: fade vs. hard blink
 WIND_BLINK_SPEED_S           = 1.0      # base period for wind animation (per LED, de-synced)
-RANDOM_ANIMATION_PHASES      = True     # give each LED its own phase
 
 # Lightning behavior
 LIGHTNING_FADE_INTENSITY     = 0.35     # after white flash, blend back toward base at this ratio
@@ -30,6 +29,14 @@ REFRESH_DISABLE_EFFECTS      = True     # during refresh, suppress wind/lightnin
 REFRESH_FADE_S               = 3.0      # used if REFRESH_ANIMATION == "fade"
 REFRESH_BLINKS               = 2        # used if REFRESH_ANIMATION == "blink"
 REFRESH_BLINK_PERIOD_S       = 0.25     # on/off cadence for refresh blinking
+
+# --- Refresh “river” animation settings ---
+REFRESH_FLOW_SPEED_S = 0.05   # per-LED fade time in the river
+REFRESH_FADE_STEPS   = 20     # smoothness (higher = smoother)
+
+# Refresh state flags
+_refreshing = False
+_refresh_stale = False
 
 # Wind thresholds
 WIND_ANIM_THRESHOLD_KT       = 25
@@ -234,6 +241,46 @@ def pick_color_for_station(cond, tnow, icao):
 
     return base
 
+def run_refresh_animation(pixels, conds, stale=False):
+    """
+    River fade: turn all LEDs OFF, then fade them in one-by-one (0..N-1).
+    If 'stale' is True (no new data), fade to COLOR_NODATA instead of base weather color.
+    """
+    usable_leds = min(len(AIRPORTS), LED_COUNT)
+
+    # 1) All off
+    for i in range(LED_COUNT):
+        pixels[i] = COLOR_CLEAR
+    pixels.show()
+
+    # 2) Targets for each mapped LED
+    targets = []
+    for idx in range(usable_leds):
+        icao = AIRPORTS[idx]
+        cond = conds.get(icao) if icao else None
+        if stale:
+            targets.append(COLOR_NODATA)
+        else:
+            if cond is None:
+                targets.append(COLOR_NODATA)
+            else:
+                targets.append(base_color(cond.get("flightCategory", "")))
+
+    # 3) Sequential fade (OFF -> target)
+    step_sleep = REFRESH_FLOW_SPEED_S / max(1, REFRESH_FADE_STEPS)
+    for idx in range(usable_leds):
+        tgt = targets[idx]
+        for s in range(1, REFRESH_FADE_STEPS + 1):
+            a = s / REFRESH_FADE_STEPS
+            pixels[idx] = (int(tgt[0]*a), int(tgt[1]*a), int(tgt[2]*a))
+            pixels.show()
+            time.sleep(step_sleep)
+
+    # 4) Any extra LEDs beyond mapping -> off
+    for idx in range(usable_leds, LED_COUNT):
+        pixels[idx] = COLOR_CLEAR
+    pixels.show()
+
 # ---------- data / refresh state ----------
 _conds = {}
 _conds_lock = threading.Lock()
@@ -244,8 +291,12 @@ _refresh_request = False
 _refresh_t0 = None
 
 def _do_fetch():
-    global _conds, _last_fetch, _fetching, _refresh_request
+    global _conds, _last_fetch, _fetching, _refreshing, _refresh_stale
     try:
+        # Keep a snapshot for change detection
+        with _conds_lock:
+            prev_conds = _conds.copy()
+
         recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
         new_conds = conditions_from_json(recs)
 
@@ -254,16 +305,34 @@ def _do_fetch():
         print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Updated METARs ({len(new_conds)} stations)")
         missing   = [a for a in AIRPORTS if a and a not in new_conds]
         lightning = sorted([k for k, v in new_conds.items() if v.get("lightning")])
-        highwinds = sorted([k for k, v in new_conds.items() if is_very_high_wind(v)])
+        highwinds = sorted([k for k, v in new_conds.items()
+                            if max(v.get('windSpeed',0), v.get('windGustSpeed',0)) >= VERY_HIGH_WIND_YELLOW_KT])
         if missing:   print("No Recent Data:", " ".join(sorted(missing)))
         if lightning: print("Lightning:", " ".join(lightning))
         if highwinds: print("High Winds:", " ".join(highwinds))
 
+        # Simple signature to detect “meaningful” changes
+        def _sig(d):
+            return sorted(
+                (k,
+                 d[k].get("flightCategory"),
+                 d[k].get("windSpeed"), d[k].get("windGustSpeed"),
+                 bool(d[k].get("lightning")),
+                 str(d[k].get("obsTime")))
+                for k in d.keys()
+            )
+
+        changed = _sig(prev_conds) != _sig(new_conds)
+
+        # Commit new data
         with _conds_lock:
             _conds = new_conds
         _last_fetch = time.time()
 
-        _refresh_request = True   # trigger refresh animation in main loop
+        # Trigger river refresh
+        _refresh_stale = (not changed)   # stale => dim gray river
+        _refreshing = True
+
     except Exception as e:
         print(f"Fetch error (keeping previous data): {e}")
         _last_fetch = time.time() - (FETCH_EVERY_S - ERROR_RETRY_S)
@@ -283,7 +352,7 @@ def trigger_fetch_if_needed(now: float):
 # =========================== MAIN ===========================
 # ============================================================
 def main():
-    global _refresh_request, _refresh_t0
+    global _refreshing, _refresh_stale
 
     usable_leds = min(len(AIRPORTS), LED_COUNT)
     pixels = neopixel.NeoPixel(
@@ -291,57 +360,32 @@ def main():
         pixel_order=LED_ORDER, auto_write=False
     )
 
+    did_startup_refresh = False
+
     while True:
         now = time.time()
         trigger_fetch_if_needed(now)
 
-        # Start refresh animation if requested
-        if _refresh_request:
-            _refresh_t0 = time.monotonic()
-            _refresh_request = False
-
+        # Snapshot current conditions
         with _conds_lock:
             conds = _conds.copy()
 
+        # 1) First-time river after initial data is available
+        if not did_startup_refresh and conds:
+            run_refresh_animation(pixels, conds, stale=False)
+            did_startup_refresh = True
+
+        # 2) River after each fetch completes
+        if _refreshing:
+            run_refresh_animation(pixels, conds, stale=_refresh_stale)
+            _refreshing = False
+
+        # 3) Normal animation frame
         tnow = time.monotonic()
-
-        # Compute refresh gating state
-        refresh_alpha = None
-        refresh_on = True  # used for blink style
-        if _refresh_t0 is not None:
-            elapsed = tnow - _refresh_t0
-            if REFRESH_ANIMATION.lower() == "fade":
-                if elapsed < REFRESH_FADE_S:
-                    refresh_alpha = elapsed / max(0.001, REFRESH_FADE_S)
-                else:
-                    _refresh_t0 = None
-            else:  # "blink"
-                total = REFRESH_BLINKS * 2 * REFRESH_BLINK_PERIOD_S
-                if elapsed < total:
-                    # on/off window
-                    refresh_on = (int(elapsed / REFRESH_BLINK_PERIOD_S) % 2 == 0)
-                else:
-                    _refresh_t0 = None
-
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
-            cond = conds.get(icao)
-
-            # During refresh, optionally suppress effects
-            if _refresh_t0 is not None and REFRESH_DISABLE_EFFECTS:
-                base = COLOR_NODATA if cond is None else base_color(cond.get("flightCategory", ""))
-                if REFRESH_ANIMATION.lower() == "fade":
-                    color = scale(base, 0.0 if refresh_alpha is None else refresh_alpha)
-                else:  # blink
-                    color = base if refresh_on else COLOR_CLEAR
-            else:
-                # Normal rendering with independent wind/lightning logic
-                color = pick_color_for_station(cond, tnow, icao)
-                # If we're in a fade-style refresh but not suppressing effects, scale overall output
-                if _refresh_t0 is not None and REFRESH_ANIMATION.lower() == "fade" and refresh_alpha is not None:
-                    color = scale(color, refresh_alpha)
-
-            pixels[idx] = color
+            cond = conds.get(icao) if icao else None
+            pixels[idx] = pick_color_for_station(cond, tnow, icao)
 
         for idx in range(usable_leds, LED_COUNT):
             pixels[idx] = COLOR_CLEAR
