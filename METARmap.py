@@ -23,6 +23,9 @@ RANDOM_ANIMATION_PHASES      = True   # Each LED blinks/fades at random timing
 # Lightning fade intensity (lower = faster fade)
 LIGHTNING_FADE_INTENSITY     = 0.35
 
+# Fade-in on new data/startup
+REFRESH_FADE_S               = 1.0    # seconds to fade from OFF -> new colors
+
 # Wind thresholds
 WIND_ANIM_THRESHOLD_KT       = 25
 ALWAYS_ANIMATE_FOR_GUSTS     = False
@@ -54,6 +57,9 @@ COLOR_LIGHTNING = (255, 255, 255)
 COLOR_HIGHWIND  = (255, 255, 0)
 COLOR_NODATA    = (5, 5, 5)
 
+# ============================================================
+# ===================== IMPLEMENTATION =======================
+# ============================================================
 
 socket.setdefaulttimeout(NETWORK_TIMEOUT_S)
 STATION_IDS = [a.strip().upper() for a in AIRPORTS if a]
@@ -71,6 +77,10 @@ def blend(c1, c2, alpha):
             int(c1[1]*(1-a)+c2[1]*a),
             int(c1[2]*(1-a)+c2[2]*a))
 
+def scale(c, alpha):
+    a = max(0.0, min(1.0, float(alpha)))
+    return (int(c[0]*a), int(c[1]*a), int(c[2]*a))
+
 # -------- Fetch / Parse METAR --------
 def fetch_bytes(url, tries=3, backoff=1.5):
     last = None
@@ -83,8 +93,7 @@ def fetch_bytes(url, tries=3, backoff=1.5):
                 return r.read()
         except Exception as e:
             last = e
-            time.sleep(backoff)
-            backoff *= 1.5
+            time.sleep(backoff); backoff *= 1.5
     if last: raise last
 
 def fetch_metar_json_ids(stations, hours, chunk_size=150):
@@ -183,14 +192,18 @@ def pick_color_for_station(cond, blink_on):
             return COLOR_HIGHWIND if blink_on else base
     return base
 
-# -------- Background Fetcher --------
+# -------- Background Fetcher + Refresh Trigger --------
 _conds = {}
 _conds_lock = threading.Lock()
 _last_fetch = 0.0
 _fetching = False
 
+# refresh state
+_refresh_request = False
+_refresh_t0 = None
+
 def _do_fetch():
-    global _conds, _last_fetch, _fetching
+    global _conds, _last_fetch, _fetching, _refresh_request
     try:
         recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
         new_conds = conditions_from_json(recs)
@@ -205,6 +218,7 @@ def _do_fetch():
         with _conds_lock:
             _conds = new_conds
         _last_fetch = time.time()
+        _refresh_request = True   # <-- ask main loop to run a fade-in
     except Exception as e:
         print(f"Fetch error: {e}")
         _last_fetch = time.time() - (FETCH_EVERY_S - ERROR_RETRY_S)
@@ -224,6 +238,8 @@ def trigger_fetch_if_needed(now: float):
 # =========================== MAIN ===========================
 # ============================================================
 def main():
+    global _refresh_request, _refresh_t0
+
     usable_leds = min(len(AIRPORTS), LED_COUNT)
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS,
@@ -231,23 +247,53 @@ def main():
     )
     phases = [random.random() * BLINK_SPEED_S for _ in range(LED_COUNT)] if RANDOM_ANIMATION_PHASES else [0]*LED_COUNT
 
+    # Trigger a refresh fade on the very first successful fetch
+    _refresh_t0 = None  # not active until _refresh_request is set by fetcher
+
     while True:
         now = time.time()
         trigger_fetch_if_needed(now)
+
+        # Activate refresh fade if requested
+        if _refresh_request:
+            _refresh_t0 = time.monotonic()
+            _refresh_request = False
+
         with _conds_lock:
             conds = _conds.copy()
+
         tnow = time.monotonic()
+        # compute alpha for refresh fade (0..1), or None if not in fade window
+        if _refresh_t0 is not None:
+            elapsed = tnow - _refresh_t0
+            if elapsed < REFRESH_FADE_S:
+                refresh_alpha = elapsed / max(0.001, REFRESH_FADE_S)
+            else:
+                refresh_alpha = None
+                _refresh_t0 = None
+        else:
+            refresh_alpha = None
+
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
             cond = conds.get(icao)
+
             if RANDOM_ANIMATION_PHASES:
                 phase = (tnow + phases[idx]) % (2 * BLINK_SPEED_S)
                 blink_on = phase < BLINK_SPEED_S
             else:
                 blink_on = (int(tnow / BLINK_SPEED_S) % 2 == 0)
-            pixels[idx] = pick_color_for_station(cond, blink_on)
+
+            color = pick_color_for_station(cond, blink_on)
+            # During refresh, fade from OFF -> target color
+            if refresh_alpha is not None:
+                color = scale(color, refresh_alpha)
+
+            pixels[idx] = color
+
         for idx in range(usable_leds, LED_COUNT):
             pixels[idx] = COLOR_CLEAR
+
         pixels.show()
         time.sleep(0.05)
 
