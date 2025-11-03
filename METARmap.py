@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, time, json, socket, urllib.parse, urllib.request, os, threading, random
+import sys, time, json, socket, urllib.parse, urllib.request, os, threading
 import datetime as dt
 import board
 import neopixel
@@ -16,27 +16,16 @@ LED_BRIGHTNESS = 0.6
 # ---- Animation behavior (wind/lightning) ----
 ACTIVATE_WIND_ANIMATION      = True
 ACTIVATE_LIGHTNING_ANIMATION = True
-FADE_INSTEAD_OF_BLINK        = True     # wind: fade vs. hard blink
-WIND_BLINK_SPEED_S           = 1.0      # base period for wind animation (per LED, de-synced)
-
+FADE_INSTEAD_OF_BLINK        = True        # wind: fade vs. hard blink
+WIND_BLINK_SPEED_S           = 1.0         # per-LED period for wind animation (desynced)
+DISPLAY_FADE_OUT_S           = 5.0         # time to fade all LEDs to black before refresh
 # Lightning behavior
-LIGHTNING_FADE_INTENSITY     = 0.35     # after white flash, blend back toward base at this ratio
-LIGHTNING_FLASH_PERIOD_S     = 1.0      # per-LED lightning cycle (phase-shifted)
+LIGHTNING_FADE_INTENSITY     = 0.35        # blend from white -> base after flash
+LIGHTNING_FLASH_PERIOD_S     = 1.0         # per-LED lightning cycle (desynced)
 
-# ---- Refresh animation (separate & independent) ----
-REFRESH_ANIMATION            = "fade"   # "fade" or "blink"
-REFRESH_DISABLE_EFFECTS      = True     # during refresh, suppress wind/lightning
-REFRESH_FADE_S               = 3.0      # used if REFRESH_ANIMATION == "fade"
-REFRESH_BLINKS               = 2        # used if REFRESH_ANIMATION == "blink"
-REFRESH_BLINK_PERIOD_S       = 0.25     # on/off cadence for refresh blinking
-
-# --- Refresh “river” animation settings ---
-REFRESH_FLOW_SPEED_S = 0.05   # per-LED fade time in the river
-REFRESH_FADE_STEPS   = 20     # smoothness (higher = smoother)
-
-# Refresh state flags
-_refreshing = False
-_refresh_stale = False
+# ---- Refresh “river” animation ----
+REFRESH_FLOW_SPEED_S = 0.05                # per-LED fade time in river
+REFRESH_FADE_STEPS   = 20                  # smoothness (higher = smoother)
 
 # Wind thresholds
 WIND_ANIM_THRESHOLD_KT       = 25
@@ -44,11 +33,11 @@ ALWAYS_ANIMATE_FOR_GUSTS     = False
 VERY_HIGH_WIND_YELLOW_KT     = 35
 
 # Data fetch
-FETCH_EVERY_S   = 600
-ERROR_RETRY_S   = 60
-LOOKBACK_HOURS  = 24
-API_BASE        = "https://aviationweather.gov"
-USER_AGENT      = "METARMap/2.0"
+FETCH_EVERY_S     = 600
+ERROR_RETRY_S     = 60
+LOOKBACK_HOURS    = 24
+API_BASE          = "https://aviationweather.gov"
+USER_AGENT        = "METARMap/2.0"
 NETWORK_TIMEOUT_S = 10
 
 # LED → Airport mapping
@@ -69,6 +58,10 @@ COLOR_LIGHTNING = (255, 255, 255)
 COLOR_HIGHWIND  = (255, 255, 0)
 COLOR_NODATA    = (5, 5, 5)
 
+# --- State machine states ---
+STATE_REFRESH = 0
+STATE_DISPLAY = 1
+
 # ============================================================
 # ===================== IMPLEMENTATION =======================
 # ============================================================
@@ -78,13 +71,16 @@ STATION_IDS = [a.strip().upper() for a in AIRPORTS if a]
 
 # ---------- utils ----------
 def to_int(v, default=0):
-    try: return int(round(float(str(v).replace('+', '').strip())))
-    except: return default
+    try:
+        return int(round(float(str(v).replace('+', '').strip())))
+    except Exception:
+        return default
 
 def clear_terminal():
     os.system("cls" if os.name == "nt" else "clear")
 
-def clamp01(x): return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+def clamp01(x): 
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
 def blend(c1, c2, alpha):
     a = clamp01(alpha)
@@ -92,11 +88,7 @@ def blend(c1, c2, alpha):
             int(c1[1]*(1-a)+c2[1]*a),
             int(c1[2]*(1-a)+c2[2]*a))
 
-def scale(c, alpha):
-    a = clamp01(alpha)
-    return (int(c[0]*a), int(c[1]*a), int(c[2]*a))
-
-# Stable per-station pseudo-random (no global RNG needed for determinism)
+# Stable per-station pseudo-random (deterministic)
 def _hash01(s: str, mod: int = 997):
     if not s: return 0.0
     return ((sum(ord(c) for c in s) % mod) + 0.5) / mod
@@ -144,11 +136,14 @@ def conditions_from_json(records):
     latest = {}
     for r in records:
         icao = (r.get("icaoId") or r.get("station") or r.get("station_id") or "").strip().upper()
-        if not icao: continue
+        if not icao: 
+            continue
         rt = r.get("reportTime")
         if rt:
-            try: obs_dt = dt.datetime.fromisoformat(rt.replace("Z","+00:00"))
-            except: obs_dt = dt.datetime.now(dt.timezone.utc)
+            try:
+                obs_dt = dt.datetime.fromisoformat(rt.replace("Z","+00:00"))
+            except Exception:
+                obs_dt = dt.datetime.now(dt.timezone.utc)
         else:
             obs_dt = dt.datetime.now(dt.timezone.utc)
         if icao not in latest or obs_dt > latest[icao]["_dt"]:
@@ -198,21 +193,19 @@ def lightning_gate_and_fade(t, icao):
     Returns (flash_on, fade_alpha) for lightning.
     - flash_on: brief white flash window
     - fade_alpha: when not in flash window, amount to blend white→base (0=no lightning)
-    Period is per-station, phase-shifted by ICAO; short flash at cycle start.
     """
     period = max(0.2, LIGHTNING_FLASH_PERIOD_S)
     start_offset = _hash01(icao[::-1], 953) * period
     x = (t + start_offset) % period
-    flash_window = 0.08  # 80 ms white pop (visual; adjust if you like)
+    flash_window = 0.08  # 80 ms white pop
     if x < flash_window:
         return True, 0.0
-    # after flash window, apply one step of quick fade if lightning present
     return False, LIGHTNING_FADE_INTENSITY
 
 def pick_color_for_station(cond, tnow, icao):
     """
-    Priority (outside refresh):
-      Lightning flash/fade (if reported) >
+    Priority:
+      Lightning flash/fade >
       Very high wind (solid yellow) >
       Wind animation (yellow over base) >
       Base color.
@@ -244,7 +237,7 @@ def pick_color_for_station(cond, tnow, icao):
 def run_refresh_animation(pixels, conds, stale=False):
     """
     River fade: turn all LEDs OFF, then fade them in one-by-one (0..N-1).
-    If 'stale' is True (no new data), fade to COLOR_NODATA instead of base weather color.
+    If 'stale' is True, fade to COLOR_NODATA instead of base weather color.
     """
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
@@ -261,10 +254,7 @@ def run_refresh_animation(pixels, conds, stale=False):
         if stale:
             targets.append(COLOR_NODATA)
         else:
-            if cond is None:
-                targets.append(COLOR_NODATA)
-            else:
-                targets.append(base_color(cond.get("flightCategory", "")))
+            targets.append(COLOR_NODATA if cond is None else base_color(cond.get("flightCategory", "")))
 
     # 3) Sequential fade (OFF -> target)
     step_sleep = REFRESH_FLOW_SPEED_S / max(1, REFRESH_FADE_STEPS)
@@ -281,21 +271,50 @@ def run_refresh_animation(pixels, conds, stale=False):
         pixels[idx] = COLOR_CLEAR
     pixels.show()
 
+def run_fade_out(pixels, conds, duration_s=1.0, steps=None):
+    """
+    Smoothly fade the *currently intended* colors to black over duration_s.
+    We snapshot each LED's current target color once to avoid flicker
+    from wind/lightning while fading.
+    """
+    usable_leds = min(len(AIRPORTS), LED_COUNT)
+    if steps is None:
+        steps = max(1, REFRESH_FADE_STEPS)
+
+    # Snapshot current colors once
+    t0 = time.monotonic()
+    snapshot = []
+    for idx in range(usable_leds):
+        icao = AIRPORTS[idx]
+        cond = conds.get(icao) if icao else None
+        color = pick_color_for_station(cond, t0, icao)
+        snapshot.append(color)
+    # Any extra LEDs → off in snapshot
+    for idx in range(usable_leds, LED_COUNT):
+        snapshot.append(COLOR_CLEAR)
+
+    # Fade down to black
+    step_sleep = float(duration_s) / steps if steps > 0 else duration_s
+    for s in range(steps, -1, -1):
+        a = s / float(steps) if steps > 0 else 0.0
+        for idx in range(LED_COUNT):
+            c = snapshot[idx]
+            pixels[idx] = (int(c[0]*a), int(c[1]*a), int(c[2]*a))
+        pixels.show()
+        time.sleep(step_sleep)
 # ---------- data / refresh state ----------
 _conds = {}
 _conds_lock = threading.Lock()
 _last_fetch = 0.0
 _fetching = False
-
-_refresh_request = False
-_refresh_t0 = None
+_refresh_stale = False
 
 def _do_fetch():
-    global _conds, _last_fetch, _fetching, _refreshing, _refresh_stale
+    global _conds, _last_fetch, _fetching, _refresh_stale
     try:
-        # Keep a snapshot for change detection
         with _conds_lock:
             prev_conds = _conds.copy()
+        is_initial = not bool(prev_conds)
 
         recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
         new_conds = conditions_from_json(recs)
@@ -311,7 +330,7 @@ def _do_fetch():
         if lightning: print("Lightning:", " ".join(lightning))
         if highwinds: print("High Winds:", " ".join(highwinds))
 
-        # Simple signature to detect “meaningful” changes
+        # "Meaningful change" signature
         def _sig(d):
             return sorted(
                 (k,
@@ -324,63 +343,66 @@ def _do_fetch():
 
         changed = _sig(prev_conds) != _sig(new_conds)
 
-        # Commit new data
         with _conds_lock:
             _conds = new_conds
         _last_fetch = time.time()
 
-        # Trigger river refresh
-        _refresh_stale = (not changed)   # stale => dim gray river
-        _refreshing = True
+        # indicate stale (no change) vs new data
+        _refresh_stale = (not changed) and (not is_initial)
 
     except Exception as e:
         print(f"Fetch error (keeping previous data): {e}")
         _last_fetch = time.time() - (FETCH_EVERY_S - ERROR_RETRY_S)
+        # treat as stale if we still have previous data; if no data at all, stale=True shows dim gray river
+        _refresh_stale = True
     finally:
         _fetching = False
 
-def trigger_fetch_if_needed(now: float):
-    global _fetching, _last_fetch
-    need_initial = False
-    with _conds_lock:
-        need_initial = not bool(_conds)
-    if ((now - _last_fetch) >= FETCH_EVERY_S or need_initial) and not _fetching:
+def start_fetch_and_wait(timeout_s=30.0, poll_s=0.05):
+    """Start a fetch thread if needed and wait (up to timeout) for it to complete."""
+    global _fetching
+    if not _fetching:
         _fetching = True
         threading.Thread(target=_do_fetch, daemon=True).start()
+    t0 = time.time()
+    while _fetching and (time.time() - t0) < timeout_s:
+        time.sleep(poll_s)
+    # done waiting (either finished or timed out)
 
 # ============================================================
 # =========================== MAIN ===========================
 # ============================================================
 def main():
-    global _refreshing, _refresh_stale
-
     usable_leds = min(len(AIRPORTS), LED_COUNT)
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS,
         pixel_order=LED_ORDER, auto_write=False
     )
 
-    did_startup_refresh = False
+    state = STATE_REFRESH
+    display_until = 0.0
 
     while True:
-        now = time.time()
-        trigger_fetch_if_needed(now)
+        if state == STATE_REFRESH:
+            # fetch (blocking wait), then run river animation
+            start_fetch_and_wait(timeout_s=NETWORK_TIMEOUT_S*3)
 
-        # Snapshot current conditions
+            with _conds_lock:
+                conds = _conds.copy()
+
+            # If we still have no conditions at all, show stale river (dim gray)
+            stale = _refresh_stale or not bool(conds)
+            run_refresh_animation(pixels, conds, stale=stale)
+
+            # next state: display until FETCH_EVERY_S elapses
+            display_until = time.time() + FETCH_EVERY_S
+            state = STATE_DISPLAY
+            continue
+
+        # STATE_DISPLAY
         with _conds_lock:
             conds = _conds.copy()
 
-        # 1) First-time river after initial data is available
-        if not did_startup_refresh and conds:
-            run_refresh_animation(pixels, conds, stale=False)
-            did_startup_refresh = True
-
-        # 2) River after each fetch completes
-        if _refreshing:
-            run_refresh_animation(pixels, conds, stale=_refresh_stale)
-            _refreshing = False
-
-        # 3) Normal animation frame
         tnow = time.monotonic()
         for idx in range(usable_leds):
             icao = AIRPORTS[idx]
@@ -392,6 +414,14 @@ def main():
 
         pixels.show()
         time.sleep(0.05)
+
+        # transition back to REFRESH after exactly FETCH_EVERY_S
+        if time.time() >= display_until:
+            # Fade out current frame before fetching new data
+            with _conds_lock:
+                conds_for_fade = _conds.copy()
+            run_fade_out(pixels, conds_for_fade, duration_s=DISPLAY_FADE_OUT_S, steps=REFRESH_FADE_STEPS)
+            state = STATE_REFRESH
 
 if __name__ == "__main__":
     try:
