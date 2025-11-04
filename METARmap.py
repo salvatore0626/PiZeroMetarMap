@@ -6,29 +6,6 @@ import neopixel
 # ============================================================
 # ===================== USER SETTINGS ========================
 # ============================================================
-
-LED_COUNT      = 20
-LED_PIN        = board.D18
-LED_ORDER      = neopixel.GRB
-LED_BRIGHTNESS = 0.5
-
-
-# Lightning behavior
-ACTIVATE_LIGHTNING_ANIMATION = True
-LIGHTNING_FLASH_PERIOD_S   = 2.25       # time between flashes (per LED, de-synced)
-LIGHTNING_FLASH_WINDOW_S   = 0.08       # how long the pure-white pop lasts
-LIGHTNING_FADE_DURATION_S  = 0.20       # how long to fade back to base after the pop
-# ---- Refresh river animation ----
-DISPLAY_FADE_OUT_S           = 2.0      # time to fade all LEDs to black before refresh
-REFRESH_FLOW_SPEED_S         = 0.17     # per-LED fade time in river
-REFRESH_FADE_STEPS           = 20       # smoothness (higher = smoother)
-
-# Wind Animations
-ACTIVATE_WIND_ANIMATION      = True
-FADE_INSTEAD_OF_BLINK        = True     # wind: fade vs. hard blink
-WIND_BLINK_SPEED_S           = 1.0      # per-LED period for wind animation (desynced)
-WIND_ANIM_THRESHOLD_KT       = 25       # >= threshold → flashing yellow
-
 # Data fetch
 FETCH_EVERY_S     = 600
 ERROR_RETRY_S     = 60
@@ -37,7 +14,29 @@ API_BASE          = "https://aviationweather.gov"
 USER_AGENT        = "METARMap/2.0"
 NETWORK_TIMEOUT_S = 10
 
+# Lightning Animations
+ACTIVATE_LIGHTNING_ANIMATION = True
+LIGHTNING_FLASH_PERIOD_S   = 2.55       # time between flashes (per LED, de-synced)
+LIGHTNING_FLASH_WINDOW_S   = 0.1        # how long the pure-white pop lasts
+LIGHTNING_FADE_DURATION_S  = 0.5        # how long to fade back to base after the pop
+
+# Wind Animations
+ACTIVATE_WIND_ANIMATION      = True
+FADE_INSTEAD_OF_BLINK        = True     # wind: fade vs. hard blink
+WIND_BLINK_SPEED_S           = 1.0      # per-LED period for wind animation (desynced)
+WIND_ANIM_THRESHOLD_KT       = 25       # >= threshold → flashing yellow
+
+#Refresh Animations
+DISPLAY_FADE_OUT_S           = 2.0      # time to fade all LEDs to black before refresh
+REFRESH_FLOW_SPEED_S         = 0.17     # per-LED fade time in river
+REFRESH_FADE_STEPS           = 20       # smoothness (higher = smoother)
+
 # LED → Airport mapping
+LED_COUNT      = 20
+LED_PIN        = board.D18
+LED_ORDER      = neopixel.GRB
+LED_BRIGHTNESS = 0.5
+
 AIRPORTS = [
     "KRBG", "K77S", "KEUG", "KCVO", "KSLE",
     "KMMV", "KUAO", "KHIO", "KTTD", "KPDX",
