@@ -20,9 +20,11 @@ FADE_INSTEAD_OF_BLINK        = True        # wind: fade vs. hard blink
 WIND_BLINK_SPEED_S           = 1.0         # per-LED period for wind animation (desynced)
 DISPLAY_FADE_OUT_S           = 3.0         # time to fade all LEDs to black before refresh
 
-# Lightning behavior
-LIGHTNING_FADE_INTENSITY     = 0.35        # blend from white -> base after flash
-LIGHTNING_FLASH_PERIOD_S     = 1.0         # per-LED lightning cycle (desynced)
+# Lightning timing
+LIGHTNING_FLASH_PERIOD_S   = 2.25   # time between flashes (per LED, de-synced)
+LIGHTNING_FLASH_WINDOW_S   = 0.08   # how long the pure-white pop lasts
+LIGHTNING_FADE_DURATION_S  = 0.80   # how long to fade back to base after the pop
+
 
 # ---- Refresh “river” animation ----
 REFRESH_FLOW_SPEED_S = 0.04                # per-LED fade time in river
@@ -190,13 +192,38 @@ def wind_blink_on(t, icao):
     return (phase < period)
 
 def lightning_gate_and_fade(t, icao):
-    period = max(0.2, jittered_period(LIGHTNING_FLASH_PERIOD_S, icao, spread=0.2))
-    start_offset = _hash01(icao[::-1], 953) * period
-    x = (t + start_offset) % period
-    flash_window = 0.08
+    """
+    Returns whiteness in [0..1] (amount of COLOR_LIGHTNING to mix in).
+    - For the initial flash window -> 1.0
+    - Then linearly (or eased) decays to 0 over LIGHTNING_FADE_DURATION_S
+    - Stays at 0 until the next period
+    """
+    # Period & phase per-station (desynced)
+    base_period = max(0.2, LIGHTNING_FLASH_PERIOD_S)
+    start_offset = _hash01(icao[::-1], 953) * base_period
+    x = (t + start_offset) % base_period
+
+    # Ensure the fade window fits in the period
+    flash_window = max(0.0, LIGHTNING_FLASH_WINDOW_S)
+    fade_dur     = max(0.0, LIGHTNING_FADE_DURATION_S)
+    max_fade_end = min(base_period, flash_window + fade_dur)
+
+    # Pure-white pop
     if x < flash_window:
-        return True, 0.0
-    return False, LIGHTNING_FADE_INTENSITY
+        return 1.0  # full whiteness
+
+    # Fade from white -> base (whiteness 1.0 -> 0.0)
+    if x < max_fade_end:
+        u = (x - flash_window) / max(1e-6, (max_fade_end - flash_window))  # 0..1
+        # Choose your curve:
+        # Linear:
+        whiteness = 1.0 - u
+        # Or a smooth ease-out:
+        # whiteness = 1.0 - (u*u*(3 - 2*u))
+        return whiteness
+
+    # After fade window: no white mixed in
+    return 0.0
 
 def jittered_period(base_s: float, icao: str, spread: float = 0.2):
     """
@@ -221,11 +248,11 @@ def pick_color_for_station(cond, tnow, icao):
     base = base_color(cond.get("flightCategory", ""))
 
     if ACTIVATE_LIGHTNING_ANIMATION and cond.get("lightning", False):
-        flash_on, fade_alpha = lightning_gate_and_fade(tnow, icao)
-        if flash_on:
+        whiteness = lightning_gate_and_fade(tnow, icao)
+        if whiteness >= 1.0:
             return COLOR_LIGHTNING
-        if fade_alpha > 0.0:
-            return blend(COLOR_LIGHTNING, base, fade_alpha)
+        if whiteness > 0.0:
+            return blend(base, COLOR_LIGHTNING, whiteness)
 
     if is_very_high_wind(cond):
         return COLOR_HIGHWIND
