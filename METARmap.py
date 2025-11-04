@@ -11,20 +11,21 @@ import neopixel
 LED_COUNT      = 20
 LED_PIN        = board.D18
 LED_ORDER      = neopixel.GRB
-LED_BRIGHTNESS = 0.6
+LED_BRIGHTNESS = 0.5
 
 # ---- Animation behavior (wind/lightning) ----
 ACTIVATE_WIND_ANIMATION      = True
 ACTIVATE_LIGHTNING_ANIMATION = True
 FADE_INSTEAD_OF_BLINK        = True        # wind: fade vs. hard blink
 WIND_BLINK_SPEED_S           = 1.0         # per-LED period for wind animation (desynced)
-DISPLAY_FADE_OUT_S           = 5.0         # time to fade all LEDs to black before refresh
+DISPLAY_FADE_OUT_S           = 3.0         # time to fade all LEDs to black before refresh
+
 # Lightning behavior
 LIGHTNING_FADE_INTENSITY     = 0.35        # blend from white -> base after flash
 LIGHTNING_FLASH_PERIOD_S     = 1.0         # per-LED lightning cycle (desynced)
 
 # ---- Refresh “river” animation ----
-REFRESH_FLOW_SPEED_S = 0.05                # per-LED fade time in river
+REFRESH_FLOW_SPEED_S = 0.04                # per-LED fade time in river
 REFRESH_FADE_STEPS   = 20                  # smoothness (higher = smoother)
 
 # Wind thresholds
@@ -33,7 +34,7 @@ ALWAYS_ANIMATE_FOR_GUSTS     = False
 VERY_HIGH_WIND_YELLOW_KT     = 35
 
 # Data fetch
-FETCH_EVERY_S     = 600
+FETCH_EVERY_S     = 300
 ERROR_RETRY_S     = 60
 LOOKBACK_HOURS    = 24
 API_BASE          = "https://aviationweather.gov"
@@ -184,23 +185,27 @@ def wind_should_animate(cond):
     return max(cond.get("windSpeed", 0), cond.get("windGustSpeed", 0)) >= WIND_ANIM_THRESHOLD_KT
 
 def wind_blink_on(t, icao):
-    # independent phase per station
-    phase = (t + _hash01(icao, 991)*WIND_BLINK_SPEED_S) % (2*WIND_BLINK_SPEED_S)
-    return (phase < WIND_BLINK_SPEED_S)
+    period = jittered_period(WIND_BLINK_SPEED_S, icao, spread=0.2)
+    phase  = (t + _hash01(icao, 991)*period) % (2*period)
+    return (phase < period)
 
 def lightning_gate_and_fade(t, icao):
-    """
-    Returns (flash_on, fade_alpha) for lightning.
-    - flash_on: brief white flash window
-    - fade_alpha: when not in flash window, amount to blend white→base (0=no lightning)
-    """
-    period = max(0.2, LIGHTNING_FLASH_PERIOD_S)
+    period = max(0.2, jittered_period(LIGHTNING_FLASH_PERIOD_S, icao, spread=0.2))
     start_offset = _hash01(icao[::-1], 953) * period
     x = (t + start_offset) % period
-    flash_window = 0.08  # 80 ms white pop
+    flash_window = 0.08
     if x < flash_window:
         return True, 0.0
     return False, LIGHTNING_FADE_INTENSITY
+
+def jittered_period(base_s: float, icao: str, spread: float = 0.2):
+    """
+    Returns base_s scaled by a per-station factor in [1-spread, 1+spread].
+    e.g., spread=0.2 -> 0.8x .. 1.2x
+    """
+    h = _hash01(icao, 733) * 2.0 - 1.0   # [-1, +1]
+    scale = 1.0 + (spread * h)
+    return max(0.05, base_s * scale)
 
 def pick_color_for_station(cond, tnow, icao):
     """
