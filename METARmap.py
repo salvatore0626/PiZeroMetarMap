@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import sys, time, json, socket, urllib.parse, urllib.request, os, threading
 import datetime as dt
 import board
@@ -13,30 +12,25 @@ LED_PIN        = board.D18
 LED_ORDER      = neopixel.GRB
 LED_BRIGHTNESS = 0.5
 
-# ---- Animation behavior (wind/lightning) ----
-ACTIVATE_WIND_ANIMATION      = True
+
+# Lightning behavior
 ACTIVATE_LIGHTNING_ANIMATION = True
-FADE_INSTEAD_OF_BLINK        = True        # wind: fade vs. hard blink
-WIND_BLINK_SPEED_S           = 1.0         # per-LED period for wind animation (desynced)
-DISPLAY_FADE_OUT_S           = 3.0         # time to fade all LEDs to black before refresh
+LIGHTNING_FADE_INTENSITY     = 0.25        # blend from white -> base after flash
+LIGHTNING_FLASH_PERIOD_S     = 2.0         # per-LED lightning cycle (desynced)
 
-# Lightning timing
-LIGHTNING_FLASH_PERIOD_S   = 2.25   # time between flashes (per LED, de-synced)
-LIGHTNING_FLASH_WINDOW_S   = 0.08   # how long the pure-white pop lasts
-LIGHTNING_FADE_DURATION_S  = 0.80   # how long to fade back to base after the pop
-
-
-# ---- Refresh “river” animation ----
-REFRESH_FLOW_SPEED_S = 0.04                # per-LED fade time in river
+# ---- Refresh river animation ----
+DISPLAY_FADE_OUT_S           = 5.0         # time to fade all LEDs to black before refresh
+REFRESH_FLOW_SPEED_S = 0.15                # per-LED fade time in river
 REFRESH_FADE_STEPS   = 20                  # smoothness (higher = smoother)
 
-# Wind thresholds
-WIND_ANIM_THRESHOLD_KT       = 25
-ALWAYS_ANIMATE_FOR_GUSTS     = False
-VERY_HIGH_WIND_YELLOW_KT     = 35
+# Wind Animations
+ACTIVATE_WIND_ANIMATION      = True
+FADE_INSTEAD_OF_BLINK        = True        # wind: fade vs. hard blink
+WIND_BLINK_SPEED_S           = 1.0         # per-LED period for wind animation (desynced)
+WIND_ANIM_THRESHOLD_KT       = 25          # >= threshold → flashing yellow
 
 # Data fetch
-FETCH_EVERY_S     = 300
+FETCH_EVERY_S     = 600
 ERROR_RETRY_S     = 60
 LOOKBACK_HOURS    = 24
 API_BASE          = "https://aviationweather.gov"
@@ -59,7 +53,7 @@ COLOR_LIFR      = (255, 0, 255)
 COLOR_CLEAR     = (0, 0, 0)
 COLOR_LIGHTNING = (255, 255, 255)
 COLOR_HIGHWIND  = (255, 255, 0)
-COLOR_NODATA    = (5, 5, 5)
+COLOR_NODATA    = (0, 0, 0)
 
 # --- State machine states ---
 STATE_REFRESH = 0
@@ -82,7 +76,7 @@ def to_int(v, default=0):
 def clear_terminal():
     os.system("cls" if os.name == "nt" else "clear")
 
-def clamp01(x): 
+def clamp01(x):
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
 def blend(c1, c2, alpha):
@@ -139,7 +133,7 @@ def conditions_from_json(records):
     latest = {}
     for r in records:
         icao = (r.get("icaoId") or r.get("station") or r.get("station_id") or "").strip().upper()
-        if not icao: 
+        if not icao:
             continue
         rt = r.get("reportTime")
         if rt:
@@ -178,67 +172,34 @@ def base_color(fc):
     if fc == "LIFR": return COLOR_LIFR
     return COLOR_CLEAR
 
-def is_very_high_wind(cond):
-    return max(cond.get("windSpeed", 0), cond.get("windGustSpeed", 0)) >= VERY_HIGH_WIND_YELLOW_KT
-
 def wind_should_animate(cond):
-    if not ACTIVATE_WIND_ANIMATION: return False
-    if ALWAYS_ANIMATE_FOR_GUSTS and cond.get("windGustSpeed", 0) > 0: return True
+    """Only threshold-based flashing (no 'solid yellow' mode)."""
     return max(cond.get("windSpeed", 0), cond.get("windGustSpeed", 0)) >= WIND_ANIM_THRESHOLD_KT
 
 def wind_blink_on(t, icao):
-    period = jittered_period(WIND_BLINK_SPEED_S, icao, spread=0.2)
+    # independent phase per station (desync)
+    period = WIND_BLINK_SPEED_S
     phase  = (t + _hash01(icao, 991)*period) % (2*period)
     return (phase < period)
 
 def lightning_gate_and_fade(t, icao):
     """
-    Returns whiteness in [0..1] (amount of COLOR_LIGHTNING to mix in).
-    - For the initial flash window -> 1.0
-    - Then linearly (or eased) decays to 0 over LIGHTNING_FADE_DURATION_S
-    - Stays at 0 until the next period
+    Returns (flash_on, fade_alpha) for lightning.
+    - flash_on: brief white flash window
+    - fade_alpha: when not in flash window, amount to blend white→base (0=no lightning)
     """
-    # Period & phase per-station (desynced)
-    base_period = max(0.2, LIGHTNING_FLASH_PERIOD_S)
-    start_offset = _hash01(icao[::-1], 953) * base_period
-    x = (t + start_offset) % base_period
-
-    # Ensure the fade window fits in the period
-    flash_window = max(0.0, LIGHTNING_FLASH_WINDOW_S)
-    fade_dur     = max(0.0, LIGHTNING_FADE_DURATION_S)
-    max_fade_end = min(base_period, flash_window + fade_dur)
-
-    # Pure-white pop
+    period = max(0.2, LIGHTNING_FLASH_PERIOD_S)
+    start_offset = _hash01(icao[::-1], 953) * period
+    x = (t + start_offset) % period
+    flash_window = 0.08  # 80 ms white pop
     if x < flash_window:
-        return 1.0  # full whiteness
-
-    # Fade from white -> base (whiteness 1.0 -> 0.0)
-    if x < max_fade_end:
-        u = (x - flash_window) / max(1e-6, (max_fade_end - flash_window))  # 0..1
-        # Choose your curve:
-        # Linear:
-        whiteness = 1.0 - u
-        # Or a smooth ease-out:
-        # whiteness = 1.0 - (u*u*(3 - 2*u))
-        return whiteness
-
-    # After fade window: no white mixed in
-    return 0.0
-
-def jittered_period(base_s: float, icao: str, spread: float = 0.2):
-    """
-    Returns base_s scaled by a per-station factor in [1-spread, 1+spread].
-    e.g., spread=0.2 -> 0.8x .. 1.2x
-    """
-    h = _hash01(icao, 733) * 2.0 - 1.0   # [-1, +1]
-    scale = 1.0 + (spread * h)
-    return max(0.05, base_s * scale)
+        return True, 0.0
+    return False, LIGHTNING_FADE_INTENSITY
 
 def pick_color_for_station(cond, tnow, icao):
     """
     Priority:
       Lightning flash/fade >
-      Very high wind (solid yellow) >
       Wind animation (yellow over base) >
       Base color.
     """
@@ -248,16 +209,13 @@ def pick_color_for_station(cond, tnow, icao):
     base = base_color(cond.get("flightCategory", ""))
 
     if ACTIVATE_LIGHTNING_ANIMATION and cond.get("lightning", False):
-        whiteness = lightning_gate_and_fade(tnow, icao)
-        if whiteness >= 1.0:
+        flash_on, fade_alpha = lightning_gate_and_fade(tnow, icao)
+        if flash_on:
             return COLOR_LIGHTNING
-        if whiteness > 0.0:
-            return blend(base, COLOR_LIGHTNING, whiteness)
+        if fade_alpha > 0.0:
+            return blend(COLOR_LIGHTNING, base, fade_alpha)
 
-    if is_very_high_wind(cond):
-        return COLOR_HIGHWIND
-
-    if wind_should_animate(cond):
+    if ACTIVATE_WIND_ANIMATION and wind_should_animate(cond):
         on = wind_blink_on(tnow, icao)
         if FADE_INSTEAD_OF_BLINK:
             return blend(base, COLOR_HIGHWIND, 1.0 if on else 0.0)
@@ -266,10 +224,9 @@ def pick_color_for_station(cond, tnow, icao):
 
     return base
 
-def run_refresh_animation(pixels, conds, stale=False):
+def run_refresh_animation(pixels, conds):
     """
-    River fade: turn all LEDs OFF, then fade them in one-by-one (0..N-1).
-    If 'stale' is True, fade to COLOR_NODATA instead of base weather color.
+    River fade: turn all LEDs OFF, then fade them in one-by-one (0..N-1) to base colors.
     """
     usable_leds = min(len(AIRPORTS), LED_COUNT)
 
@@ -283,10 +240,7 @@ def run_refresh_animation(pixels, conds, stale=False):
     for idx in range(usable_leds):
         icao = AIRPORTS[idx]
         cond = conds.get(icao) if icao else None
-        if stale:
-            targets.append(COLOR_NODATA)
-        else:
-            targets.append(COLOR_NODATA if cond is None else base_color(cond.get("flightCategory", "")))
+        targets.append(COLOR_NODATA if cond is None else base_color(cond.get("flightCategory", "")))
 
     # 3) Sequential fade (OFF -> target)
     step_sleep = REFRESH_FLOW_SPEED_S / max(1, REFRESH_FADE_STEPS)
@@ -321,7 +275,6 @@ def run_fade_out(pixels, conds, duration_s=1.0, steps=None):
         cond = conds.get(icao) if icao else None
         color = pick_color_for_station(cond, t0, icao)
         snapshot.append(color)
-    # Any extra LEDs → off in snapshot
     for idx in range(usable_leds, LED_COUNT):
         snapshot.append(COLOR_CLEAR)
 
@@ -334,59 +287,37 @@ def run_fade_out(pixels, conds, duration_s=1.0, steps=None):
             pixels[idx] = (int(c[0]*a), int(c[1]*a), int(c[2]*a))
         pixels.show()
         time.sleep(step_sleep)
+
 # ---------- data / refresh state ----------
 _conds = {}
 _conds_lock = threading.Lock()
 _last_fetch = 0.0
 _fetching = False
-_refresh_stale = False
 
 def _do_fetch():
-    global _conds, _last_fetch, _fetching, _refresh_stale
+    global _conds, _last_fetch, _fetching
     try:
-        with _conds_lock:
-            prev_conds = _conds.copy()
-        is_initial = not bool(prev_conds)
-
         recs = fetch_metar_json_ids(STATION_IDS, LOOKBACK_HOURS)
         new_conds = conditions_from_json(recs)
 
-        # CLI summary
+        # CLI summary (lists use the same threshold logic as the animation)
         clear_terminal()
         print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Updated METARs ({len(new_conds)} stations)")
         missing   = [a for a in AIRPORTS if a and a not in new_conds]
         lightning = sorted([k for k, v in new_conds.items() if v.get("lightning")])
         highwinds = sorted([k for k, v in new_conds.items()
-                            if max(v.get('windSpeed',0), v.get('windGustSpeed',0)) >= VERY_HIGH_WIND_YELLOW_KT])
+                            if max(v.get('windSpeed',0), v.get('windGustSpeed',0)) >= WIND_ANIM_THRESHOLD_KT])
         if missing:   print("No Recent Data:", " ".join(sorted(missing)))
         if lightning: print("Lightning:", " ".join(lightning))
         if highwinds: print("High Winds:", " ".join(highwinds))
-
-        # "Meaningful change" signature
-        def _sig(d):
-            return sorted(
-                (k,
-                 d[k].get("flightCategory"),
-                 d[k].get("windSpeed"), d[k].get("windGustSpeed"),
-                 bool(d[k].get("lightning")),
-                 str(d[k].get("obsTime")))
-                for k in d.keys()
-            )
-
-        changed = _sig(prev_conds) != _sig(new_conds)
 
         with _conds_lock:
             _conds = new_conds
         _last_fetch = time.time()
 
-        # indicate stale (no change) vs new data
-        _refresh_stale = (not changed) and (not is_initial)
-
     except Exception as e:
         print(f"Fetch error (keeping previous data): {e}")
         _last_fetch = time.time() - (FETCH_EVERY_S - ERROR_RETRY_S)
-        # treat as stale if we still have previous data; if no data at all, stale=True shows dim gray river
-        _refresh_stale = True
     finally:
         _fetching = False
 
@@ -399,7 +330,6 @@ def start_fetch_and_wait(timeout_s=30.0, poll_s=0.05):
     t0 = time.time()
     while _fetching and (time.time() - t0) < timeout_s:
         time.sleep(poll_s)
-    # done waiting (either finished or timed out)
 
 # ============================================================
 # =========================== MAIN ===========================
@@ -416,17 +346,13 @@ def main():
 
     while True:
         if state == STATE_REFRESH:
-            # fetch (blocking wait), then run river animation
+            # fetch (blocking wait), then river animation
             start_fetch_and_wait(timeout_s=NETWORK_TIMEOUT_S*3)
-
             with _conds_lock:
                 conds = _conds.copy()
+            run_refresh_animation(pixels, conds)
 
-            # If we still have no conditions at all, show stale river (dim gray)
-            stale = _refresh_stale or not bool(conds)
-            run_refresh_animation(pixels, conds, stale=stale)
-
-            # next state: display until FETCH_EVERY_S elapses
+            # display until next refresh
             display_until = time.time() + FETCH_EVERY_S
             state = STATE_DISPLAY
             continue
