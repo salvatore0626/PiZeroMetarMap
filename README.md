@@ -70,6 +70,33 @@
 | `COLOR_HIGHWIND` | Color used for high-wind animations. |
 | `COLOR_NODATA` | Color shown when no recent METAR data is available. |
 
+
+####################################################################################### 
+###################################### Pi Updates ##################################### #######################################################################################
+
+sudo apt update
+sudo apt upgrade -y
+sudo apt install python3 python3-pip git -y
+
+sudo raspi-config
+  Interface Options → Enable SPI → Yes
+  Interface Options → Enable GPIO → Yes
+
+sudo reboot
+
+sudo pip3 install adafruit-circuitpython-neopixel adafruit-blinka
+
+sudo pip3 install requests
+
+#Test your LED Strip
+sudo python3 test_pixels.py
+
+#Test your connection to aviation weather
+ping aviationweather.gov -c 3
+
+Run the program
+#sudo python3 metar_map.py
+
 #######################################################################################
 ############################### Set up Automated Startup ##############################
 #######################################################################################
@@ -103,7 +130,12 @@ sudo systemctl start metarmap.service
 3️⃣ Check that it’s running
 systemctl status metarmap.service
 
-
+⚙️ Commands
+sudo systemctl start metarmap
+sudo systemctl enable metarmap
+sudo systemctl status metarmap
+sudo systemctl stop metarmap
+sudo journalctl -u metarmap -f
 
 Check logs with
 journalctl -u metarmap.service -f
