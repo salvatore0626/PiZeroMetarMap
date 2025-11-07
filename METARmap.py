@@ -73,7 +73,11 @@ def to_int(v, default=0):
         return default
 
 def clear_terminal():
-    os.system("cls" if os.name == "nt" else "clear")
+    try:
+        if sys.stdout.isatty() and os.environ.get("TERM"):
+            os.system("clear")
+    except Exception:
+        pass
 
 def clamp01(x):
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x

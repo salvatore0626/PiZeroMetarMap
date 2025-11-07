@@ -1,0 +1,21 @@
+[Unit]
+Description=METAR Map LED Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/leaheli/PiZeroMetarMap/METARmap.py
+WorkingDirectory=/home/leaheli/PiZeroMetarMap
+Environment=PYTHONUNBUFFERED=1
+# Optional: avoid the TERM warning without code change
+# Environment=TERM=linux
+ExecStartPre=/bin/sleep 8
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+User=root
+
+[Install]
+WantedBy=multi-user.target
